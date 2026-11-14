@@ -22,6 +22,7 @@
 #include <type_traits> // is_same
 #include <vector> // vector
 
+#include <nlohmann/detail/attr_traits.hpp>
 #include <nlohmann/detail/conversions/to_chars.hpp>
 #include <nlohmann/detail/exceptions.hpp>
 #include <nlohmann/detail/input/string_scan.hpp>
@@ -152,70 +153,7 @@ class serializer
                     return;
                 }
 
-                if (val.m_data.m_value.object->empty())
-                {
-                    put_literal("{}");
-                    return;
-                }
-
-                if (pretty_print)
-                {
-                    put_literal("{\n");
-
-                    // variable to hold indentation for recursive calls
-                    const auto new_indent = next_indent(current_indent, indent_step);
-
-                    // first n-1 elements
-                    auto i = val.m_data.m_value.object->cbegin();
-                    for (std::size_t cnt = 0; cnt < val.m_data.m_value.object->size() - 1; ++cnt, ++i)
-                    {
-                        put_indent(new_indent);
-                        put_char('"');
-                        dump_escaped(i->first);
-                        put_literal("\": ");
-                        dump_internal(i->second, new_indent, depth + 1);
-                        put_literal(",\n");
-                    }
-
-                    // last element
-                    JSON_ASSERT(i != val.m_data.m_value.object->cend());
-                    JSON_ASSERT(std::next(i) == val.m_data.m_value.object->cend());
-                    put_indent(new_indent);
-                    put_char('"');
-                    dump_escaped(i->first);
-                    put_literal("\": ");
-                    dump_internal(i->second, new_indent, depth + 1);
-
-                    put_char('\n');
-                    put_indent(current_indent);
-                    put_char('}');
-                }
-                else
-                {
-                    put_char('{');
-
-                    // first n-1 elements
-                    auto i = val.m_data.m_value.object->cbegin();
-                    for (std::size_t cnt = 0; cnt < val.m_data.m_value.object->size() - 1; ++cnt, ++i)
-                    {
-                        put_char('"');
-                        dump_escaped(i->first);
-                        put_literal("\":");
-                        dump_internal(i->second, current_indent, depth + 1);
-                        put_char(',');
-                    }
-
-                    // last element
-                    JSON_ASSERT(i != val.m_data.m_value.object->cend());
-                    JSON_ASSERT(std::next(i) == val.m_data.m_value.object->cend());
-                    put_char('"');
-                    dump_escaped(i->first);
-                    put_literal("\":");
-                    dump_internal(i->second, current_indent, depth + 1);
-
-                    put_char('}');
-                }
-
+                dump_object(val, current_indent, depth, attributes_tag {});
                 return;
             }
 
@@ -295,6 +233,228 @@ class serializer
     }
 
   private:
+    /// whether the object type of the serialized value stores attributes
+    static constexpr bool attributes_enabled() noexcept
+    {
+        return detail::basic_json_has_attributes<BasicJsonType>::value;
+    }
+
+    /// selects the attribute-aware or the plain flavor of the helpers below
+    using attributes_tag = std::integral_constant<bool, attributes_enabled()>;
+
+    /// @brief whether @a val serializes as the empty object `{}`
+    bool object_is_empty(const BasicJsonType& val, std::false_type /*attributes*/) const
+    {
+        return val.m_data.m_value.object->empty();
+    }
+
+    /// An attribute-aware object is empty once both its attributes and its
+    /// members are gone.
+    bool object_is_empty(const BasicJsonType& val, std::true_type /*attributes*/) const
+    {
+        return val.m_data.m_value.object->empty()
+               && val.m_data.m_value.object->attr_empty();
+    }
+
+    /// @brief write the attributes of @a val
+    ///
+    /// Attributes precede the members of an object and are written as an
+    /// unquoted identifier, a colon, and a primitive value. @a indent is the
+    /// indentation of the entries of @a val in pretty-printed output.
+    ///
+    /// @return the number of attributes written
+    std::size_t dump_attributes(const BasicJsonType& /*val*/,
+                                const std::size_t /*indent*/,
+                                std::false_type /*attributes*/)
+    {
+        return 0;
+    }
+
+    std::size_t dump_attributes(const BasicJsonType& val, const std::size_t indent,
+                                std::true_type /*attributes*/)
+    {
+        std::size_t written = 0;
+
+        for (auto it = val.m_data.m_value.object->attr_cbegin();
+                it != val.m_data.m_value.object->attr_cend(); ++it)
+        {
+            // the separator goes in front of every attribute but the first
+            if (written != 0)
+            {
+                if (pretty_print)
+                {
+                    put_literal(",\n");
+                }
+                else
+                {
+                    put_char(',');
+                }
+            }
+
+            if (pretty_print)
+            {
+                put_indent(indent);
+            }
+
+            // the name of an attribute is an identifier and stays unquoted
+            put_string(it->first, 0, it->first.size());
+
+            if (pretty_print)
+            {
+                put_literal(": ");
+            }
+            else
+            {
+                put_literal(":");
+            }
+
+            // the value of an attribute is always a primitive
+            dump_scalar(it->second, indent);
+            ++written;
+        }
+
+        return written;
+    }
+
+    /// @brief serialize an object of an object type without attributes
+    void dump_object(const BasicJsonType& val, const std::size_t current_indent,
+                     const std::size_t depth, std::false_type /*attributes*/)
+    {
+        if (val.m_data.m_value.object->empty())
+        {
+            put_literal("{}");
+            return;
+        }
+
+        if (pretty_print)
+        {
+            put_literal("{\n");
+
+            // variable to hold indentation for recursive calls
+            const auto new_indent = next_indent(current_indent, indent_step);
+
+            // first n-1 elements
+            auto i = val.m_data.m_value.object->cbegin();
+            for (std::size_t cnt = 0; cnt < val.m_data.m_value.object->size() - 1; ++cnt, ++i)
+            {
+                put_indent(new_indent);
+                put_char('"');
+                dump_escaped(i->first);
+                put_literal("\": ");
+                dump_internal(i->second, new_indent, depth + 1);
+                put_literal(",\n");
+            }
+
+            // last element
+            JSON_ASSERT(i != val.m_data.m_value.object->cend());
+            JSON_ASSERT(std::next(i) == val.m_data.m_value.object->cend());
+            put_indent(new_indent);
+            put_char('"');
+            dump_escaped(i->first);
+            put_literal("\": ");
+            dump_internal(i->second, new_indent, depth + 1);
+
+            put_char('\n');
+            put_indent(current_indent);
+            put_char('}');
+        }
+        else
+        {
+            put_char('{');
+
+            // first n-1 elements
+            auto i = val.m_data.m_value.object->cbegin();
+            for (std::size_t cnt = 0; cnt < val.m_data.m_value.object->size() - 1; ++cnt, ++i)
+            {
+                put_char('"');
+                dump_escaped(i->first);
+                put_literal("\":");
+                dump_internal(i->second, current_indent, depth + 1);
+                put_char(',');
+            }
+
+            // last element
+            JSON_ASSERT(i != val.m_data.m_value.object->cend());
+            JSON_ASSERT(std::next(i) == val.m_data.m_value.object->cend());
+            put_char('"');
+            dump_escaped(i->first);
+            put_literal("\":");
+            dump_internal(i->second, current_indent, depth + 1);
+
+            put_char('}');
+        }
+    }
+
+    /// @brief serialize an object together with its attributes
+    ///
+    /// The attributes come first, then the members. An attribute value is a
+    /// primitive, so only the members can lead to a nested container.
+    void dump_object(const BasicJsonType& val, const std::size_t current_indent,
+                     const std::size_t depth, std::true_type /*attributes*/)
+    {
+        if (object_is_empty(val, std::true_type {}))
+        {
+            put_literal("{}");
+            return;
+        }
+
+        if (pretty_print)
+        {
+            put_literal("{\n");
+
+            // variable to hold indentation for recursive calls
+            const auto new_indent = next_indent(current_indent, indent_step);
+
+            // the attributes come first
+            std::size_t written = dump_attributes(val, new_indent, std::true_type {});
+
+            for (auto i = val.m_data.m_value.object->cbegin();
+                    i != val.m_data.m_value.object->cend(); ++i)
+            {
+                // a separator between the attributes and the first member,
+                // and between each pair of members
+                if (written != 0)
+                {
+                    put_literal(",\n");
+                }
+
+                put_indent(new_indent);
+                put_char('"');
+                dump_escaped(i->first);
+                put_literal("\": ");
+                dump_internal(i->second, new_indent, depth + 1);
+                ++written;
+            }
+
+            put_char('\n');
+            put_indent(current_indent);
+            put_char('}');
+        }
+        else
+        {
+            put_char('{');
+
+            std::size_t written = dump_attributes(val, current_indent, std::true_type {});
+
+            for (auto i = val.m_data.m_value.object->cbegin();
+                    i != val.m_data.m_value.object->cend(); ++i)
+            {
+                if (written != 0)
+                {
+                    put_char(',');
+                }
+
+                put_char('"');
+                dump_escaped(i->first);
+                put_literal("\":");
+                dump_internal(i->second, current_indent, depth + 1);
+                ++written;
+            }
+
+            put_char('}');
+        }
+    }
+
     /*!
     @brief write out @a val and everything below it without the call stack
 
@@ -336,8 +496,10 @@ class serializer
                 }
 
                 // the separator goes in front of every element but the first,
-                // which puts exactly one between each pair and none at the end
-                if (frame.object_it != object->cbegin())
+                // which puts exactly one between each pair and none at the
+                // end; the first member is not the first element when the
+                // object started with attributes
+                if (frame.separator_pending || frame.object_it != object->cbegin())
                 {
                     if (pretty_print)
                     {
@@ -437,6 +599,10 @@ class serializer
         /// detail/iterators/internal_iterator.hpp
         typename BasicJsonType::object_t::const_iterator object_it{};
         typename BasicJsonType::array_t::const_iterator array_it{};
+        /// whether something was written before the members, which then needs
+        /// a separator in front of its first member; only attribute-aware
+        /// object types ever set this
+        bool separator_pending = false;
         /// the indentation of the container itself, used by its closing bracket
         std::size_t current_indent;
         /// the indentation of the container's elements
@@ -459,7 +625,7 @@ class serializer
         {
             case value_t::object:
             {
-                if (val.m_data.m_value.object->empty())
+                if (object_is_empty(val, attributes_tag {}))
                 {
                     put_literal("{}");
                     return;
@@ -477,8 +643,14 @@ class serializer
                     put_char('{');
                 }
 
+                // the attributes are written here; their values are
+                // primitives, so the frame below only walks the members
+                const std::size_t attributes_written =
+                    dump_attributes(val, child_indent, attributes_tag {});
+
                 stack.emplace_back(&val, current_indent, child_indent);
                 stack.back().object_it = val.m_data.m_value.object->cbegin();
+                stack.back().separator_pending = (attributes_written != 0);
                 return;
             }
 

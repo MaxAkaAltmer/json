@@ -65,9 +65,23 @@ using json = basic_json<>;
 template<class Key, class T, class IgnoredLess, class Allocator>
 struct ordered_map; // IWYU pragma: keep
 
+template<class Key, class T, class Cmp, class Allocator>
+class map_with_attrs; // IWYU pragma: keep
+
+template<class Key, class T, class IgnoredLess, class Allocator>
+class ordered_map_with_attrs; // IWYU pragma: keep
+
 /// @brief specialization that maintains the insertion order of object keys
 /// @sa https://json.nlohmann.me/api/ordered_json/
 using ordered_json = basic_json<nlohmann::ordered_map>;
+
+/// @brief a JSON value whose objects can store attributes in addition to
+/// their members; see nlohmann/map_with_attrs.hpp
+using json_attrs = basic_json<nlohmann::map_with_attrs>;
+
+/// @brief an ordered JSON value whose objects can store attributes in
+/// addition to their members; see nlohmann/ordered_map_with_attrs.hpp
+using ordered_json_attrs = basic_json<nlohmann::ordered_map_with_attrs>;
 
 NLOHMANN_JSON_NAMESPACE_END
 

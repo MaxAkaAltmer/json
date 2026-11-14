@@ -17,6 +17,7 @@
 #include <utility> // move
 #include <vector> // vector
 
+#include <nlohmann/detail/attr_traits.hpp>
 #include <nlohmann/detail/input/input_adapters.hpp>
 #include <nlohmann/detail/input/number_parse.hpp>
 #include <nlohmann/detail/input/position_t.hpp>
@@ -56,7 +57,8 @@ class lexer_base
         value_separator,  ///< the value separator `,`
         parse_error,      ///< indicating a parse error
         end_of_input,     ///< indicating the end of the input buffer
-        literal_or_value  ///< a literal or the begin of a value (only for diagnostics)
+        literal_or_value,   ///< a literal or the begin of a value (only for diagnostics)
+        value_identifier    ///< an unquoted identifier -- use get_string() for actual value
     };
 
     /// return name of values of type token_type (only used for errors)
@@ -98,6 +100,8 @@ class lexer_base
                 return "end of input";
             case token_type::literal_or_value:
                 return "'[', '{', or a literal";
+            case token_type::value_identifier:
+                return "identifier";
             // LCOV_EXCL_START
             default: // catch non-enum values
                 return "unknown token";
@@ -1608,6 +1612,12 @@ scan_number_done:
     token_type scan_literal(const char_type* literal_text, const std::size_t length,
                             token_type return_type)
     {
+        if (JSON_HEDLEY_UNLIKELY(length == 0))
+        {
+            error_message = "invalid literal";
+            return token_type::parse_error;
+        }
+
         JSON_ASSERT(char_traits<char_type>::to_char_type(current) == literal_text[0]);
         for (std::size_t i = 1; i < length; ++i)
         {
@@ -1618,6 +1628,87 @@ scan_number_done:
             }
         }
         return return_type;
+    }
+
+    /// whether @a c may start a C++ identifier
+    static bool is_identifier_start(const char_int_type c) noexcept
+    {
+        // eof() may not compare as less than the ASCII range if char_int_type
+        // is unsigned, and must never be scanned as an identifier
+        if (JSON_HEDLEY_UNLIKELY(c == static_cast<char_int_type>(char_traits<char_type>::eof())))
+        {
+            return false;
+        }
+
+        return c == static_cast<char_int_type>('_')
+               || (c >= static_cast<char_int_type>('a') && c <= static_cast<char_int_type>('z'))
+               || (c >= static_cast<char_int_type>('A') && c <= static_cast<char_int_type>('Z'));
+    }
+
+    /// whether @a c may continue a C++ identifier
+    static bool is_identifier_char(const char_int_type c) noexcept
+    {
+        return is_identifier_start(c)
+               || (c >= static_cast<char_int_type>('0') && c <= static_cast<char_int_type>('9'));
+    }
+
+    /// @brief compare the scanned token with an ASCII literal
+    /// The comparison is written by hand because string_t is user-replaceable
+    /// and only its element type is guaranteed.
+    bool token_buffer_equals(const char* literal) const
+    {
+        std::size_t i = 0;
+        for (; i < token_buffer.size(); ++i)
+        {
+            if (literal[i] == '\0'
+                    || static_cast<char>(token_buffer[i]) != literal[i])
+            {
+                return false;
+            }
+        }
+        return literal[i] == '\0';
+    }
+
+    /*!
+    @brief scan an identifier `[A-Za-z_][A-Za-z0-9_]*`
+
+    The identifier is only meaningful as an attribute name in the JSON with
+    attributes format, so this function is only reached when
+    @ref attributes_enabled holds. `true`, `false` and `null` keep their
+    meaning as literals and are reported as such.
+
+    @pre @ref current is the first character of the identifier
+
+    @return token_type::value_identifier, or the token type of one of the
+            three literals, or token_type::parse_error
+    */
+    token_type scan_identifier()
+    {
+        // reset token_buffer; `current` holds the first character already
+        reset();
+        add(current);
+
+        while (is_identifier_char(get()))
+        {
+            add(current);
+        }
+
+        // the character that ended the identifier belongs to the next token
+        unget();
+
+        if (token_buffer_equals("true"))
+        {
+            return token_type::literal_true;
+        }
+        if (token_buffer_equals("false"))
+        {
+            return token_type::literal_false;
+        }
+        if (token_buffer_equals("null"))
+        {
+            return token_type::literal_null;
+        }
+        return token_type::value_identifier;
     }
 
     /////////////////////
@@ -1949,6 +2040,15 @@ scan_number_done:
         return error_message;
     }
 
+    /// whether unquoted identifiers may be scanned as attribute names
+    ///
+    /// This is a function rather than a variable so that the trait is only
+    /// evaluated where the lexer is instantiated with a complete JSON type.
+    static constexpr bool attributes_enabled() noexcept
+    {
+        return detail::basic_json_has_attributes<BasicJsonType>::value;
+    }
+
     /////////////////////
     // actual scanner
     /////////////////////
@@ -2026,6 +2126,14 @@ scan_number_done:
 
             // skip following whitespace
             skip_whitespace();
+        }
+
+        // in the JSON with attributes format an identifier is scanned as a
+        // whole token, so that names such as `nullptr` or `truex` are not
+        // mistaken for the corresponding literal prefixes
+        if (JSON_HEDLEY_UNLIKELY(attributes_enabled() && is_identifier_start(current)))
+        {
+            return scan_identifier();
         }
 
         switch (current)

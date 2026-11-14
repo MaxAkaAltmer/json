@@ -15,6 +15,7 @@
 #include <utility> // move
 #include <vector> // vector
 
+#include <nlohmann/detail/attr_traits.hpp>
 #include <nlohmann/detail/exceptions.hpp>
 #include <nlohmann/detail/input/input_adapters.hpp>
 #include <nlohmann/detail/input/json_sax.hpp>
@@ -247,14 +248,17 @@ class parser
                             break;
                         }
 
+                        // an identifier key denotes an attribute
+                        const bool key_is_attribute = (last_token == token_type::value_identifier);
+
                         // parse key
-                        if (JSON_HEDLEY_UNLIKELY(last_token != token_type::value_string))
+                        if (JSON_HEDLEY_UNLIKELY(!token_is_object_key()))
                         {
                             return sax->parse_error(m_lexer.get_position(),
                                                     m_lexer.get_token_string(),
                                                     parse_error::create(101, m_lexer.get_position(), exception_message(token_type::value_string, "object key"), nullptr));
                         }
-                        if (JSON_HEDLEY_UNLIKELY(!sax->key(m_lexer.get_string())))
+                        if (JSON_HEDLEY_UNLIKELY(!emit_object_key(sax)))
                         {
                             return false;
                         }
@@ -272,6 +276,12 @@ class parser
 
                         // parse values
                         get_token();
+
+                        // an attribute only holds primitives
+                        if (JSON_HEDLEY_UNLIKELY(key_is_attribute && !token_is_primitive_value()))
+                        {
+                            return attribute_value_error(sax);
+                        }
                         continue;
                     }
 
@@ -470,15 +480,18 @@ class parser
                 // if ignore_trailing_commas and last_token is }, we can continue to "closing }"
                 if (!(ignore_trailing_commas && last_token == token_type::end_object))
                 {
+                    // an identifier key denotes an attribute
+                    const bool key_is_attribute = (last_token == token_type::value_identifier);
+
                     // parse key
-                    if (JSON_HEDLEY_UNLIKELY(last_token != token_type::value_string))
+                    if (JSON_HEDLEY_UNLIKELY(!token_is_object_key()))
                     {
                         return sax->parse_error(m_lexer.get_position(),
                                                 m_lexer.get_token_string(),
                                                 parse_error::create(101, m_lexer.get_position(), exception_message(token_type::value_string, "object key"), nullptr));
                     }
 
-                    if (JSON_HEDLEY_UNLIKELY(!sax->key(m_lexer.get_string())))
+                    if (JSON_HEDLEY_UNLIKELY(!emit_object_key(sax)))
                     {
                         return false;
                     }
@@ -493,6 +506,12 @@ class parser
 
                     // parse values
                     get_token();
+
+                    // an attribute only holds primitives
+                    if (JSON_HEDLEY_UNLIKELY(key_is_attribute && !token_is_primitive_value()))
+                    {
+                        return attribute_value_error(sax);
+                    }
                     continue;
                 }
             }
@@ -520,6 +539,80 @@ class parser
                                     m_lexer.get_token_string(),
                                     parse_error::create(101, m_lexer.get_position(), exception_message(token_type::end_object, "object"), nullptr));
         }
+    }
+
+    /// whether the object type of the parsed value stores attributes
+    static constexpr bool attributes_enabled() noexcept
+    {
+        return detail::basic_json_has_attributes<BasicJsonType>::value;
+    }
+
+    /// whether the last token can start an object entry: a quoted key, or, in
+    /// the JSON with attributes format, an unquoted identifier
+    bool token_is_object_key() const noexcept
+    {
+        return last_token == token_type::value_string
+               || (attributes_enabled() && last_token == token_type::value_identifier);
+    }
+
+    /// whether the last token can be the value of an attribute: only
+    /// primitives are allowed, nested objects and arrays are not
+    bool token_is_primitive_value() const noexcept
+    {
+        switch (last_token)
+        {
+            case token_type::value_string:
+            case token_type::value_integer:
+            case token_type::value_unsigned:
+            case token_type::value_float:
+            case token_type::literal_true:
+            case token_type::literal_false:
+            case token_type::literal_null:
+                return true;
+
+            case token_type::uninitialized:
+            case token_type::value_identifier:
+            case token_type::begin_array:
+            case token_type::begin_object:
+            case token_type::end_array:
+            case token_type::end_object:
+            case token_type::name_separator:
+            case token_type::value_separator:
+            case token_type::parse_error:
+            case token_type::end_of_input:
+            case token_type::literal_or_value:
+            default:
+                return false;
+        }
+    }
+
+    /*!
+    @brief report the pending object key to @a sax
+
+    A key read as an identifier is prefixed with the attribute sentinel byte,
+    which is where the object container routes it into its attribute storage.
+    */
+    template<typename SAX>
+    bool emit_object_key(SAX* sax)
+    {
+        if (attributes_enabled() && last_token == token_type::value_identifier)
+        {
+            string_t key(static_cast<typename string_t::size_type>(1),
+                         static_cast<typename string_t::value_type>(detail::attr_key<string_t>::marker()));
+            key.append(m_lexer.get_string());
+            return sax->key(key);
+        }
+
+        return sax->key(m_lexer.get_string());
+    }
+
+    /// @brief reject a structured value stored under an attribute name
+    template<typename SAX>
+    bool attribute_value_error(SAX* sax)
+    {
+        return sax->parse_error(m_lexer.get_position(), m_lexer.get_token_string(),
+                                parse_error::create(101, m_lexer.get_position(),
+                                                    "an attribute value must be a primitive (null, a boolean, a number or a string)", nullptr));
     }
 
     /// get next token from lexer

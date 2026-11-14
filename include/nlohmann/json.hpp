@@ -45,6 +45,7 @@
 #include <nlohmann/adl_serializer.hpp> // IWYU pragma: keep
 #include <nlohmann/byte_container_with_subtype.hpp>
 #include <nlohmann/detail/abi_macros.hpp>
+#include <nlohmann/detail/attr_traits.hpp>
 #include <nlohmann/detail/conversions/from_json.hpp> // IWYU pragma: keep
 #include <nlohmann/detail/conversions/to_json.hpp> // IWYU pragma: keep
 #include <nlohmann/detail/exceptions.hpp>
@@ -75,7 +76,9 @@
 #include <nlohmann/detail/recursion_depth_limit.hpp>
 #include <nlohmann/detail/value_t.hpp>
 #include <nlohmann/json_fwd.hpp>
+#include <nlohmann/map_with_attrs.hpp> // IWYU pragma: keep
 #include <nlohmann/ordered_map.hpp> // IWYU pragma: keep
+#include <nlohmann/ordered_map_with_attrs.hpp> // IWYU pragma: keep
 #include <nlohmann/thirdparty/hedley/hedley.hpp>
 
 #if defined(JSON_HAS_CPP_17)
@@ -335,7 +338,7 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
             }
         };
 #elif defined(__HP_cc) || defined(__HP_aCC)
-        result["compiler"] = "hp"
+        result["compiler"] = "hp";
 #elif defined(__IBMCPP__)
         result["compiler"] = {{"family", "ilecpp"}, {"version", __IBMCPP__}};
 #elif defined(_MSC_VER)
@@ -763,6 +766,25 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
         static_cast<void>(check_parents);
     }
 
+    // refreshes the parent pointers of the attribute values of an object that
+    // stores attributes; the attribute values of an ordered attribute-aware
+    // map may move when a new attribute is appended
+    void set_attribute_parents(std::true_type /* has attributes */)
+    {
+#if JSON_DIAGNOSTICS
+        for (auto it = m_data.m_value.object->attr_begin();
+                it != m_data.m_value.object->attr_end(); ++it)
+        {
+            it->second.m_parent = this;
+        }
+#endif
+    }
+
+    // an object type without attributes stores nothing that needs a parent;
+    // the overload above is never instantiated for it, and this one is never
+    // called, because the caller selects it by the has-attributes trait
+    static void set_attribute_parents(std::false_type /* has attributes */) {}
+
     void set_parents()
     {
 #if JSON_DIAGNOSTICS
@@ -783,6 +805,12 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
                 {
                     element.second.m_parent = this;
                 }
+
+                // the attribute values live in a sub-container of their own, so
+                // the loop above never reaches them
+                set_attribute_parents(std::integral_constant<bool,
+                                          detail::basic_json_has_attributes<basic_json>::value> {});
+
                 break;
             }
 
@@ -3737,6 +3765,407 @@ class basic_json // NOLINT(cppcoreguidelines-special-member-functions,hicpp-spec
     }
 
     /// @}
+
+    ////////////////
+    // attributes //
+    ////////////////
+
+    // Attributes are a second, separate namespace of a JSON object. They are
+    // stored by the attribute-aware object types nlohmann::map_with_attrs and
+    // nlohmann::ordered_map_with_attrs next to the regular members, they are
+    // written as an unquoted C++ identifier followed by a primitive value -
+    // city: "Leningrad", postalCode: 101101 - and, unlike a member, the value
+    // of an attribute can be neither an object nor an array.
+    //
+    // Members are untouched by all of this: size(), the regular iterators,
+    // get<std::map<...>>() and operator== keep seeing the members only. Use
+    // equals_with_attributes() to compare values including their attributes.
+    //
+    // For an object type without attribute support - the default, hence every
+    // stock nlohmann::json and nlohmann::ordered_json - everything below is
+    // inert: the attribute iterator types resolve to void, and calling any of
+    // these functions reports the static_assert of check_attribute_support().
+
+    /// @brief iterator type over the attributes of an object
+    using attr_iterator = typename detail::attr_iterators<object_t>::iterator;
+
+    /// @brief constant iterator type over the attributes of an object
+    using const_attr_iterator = typename detail::attr_iterators<object_t>::const_iterator;
+
+    /// @brief a view on the attributes of a JSON object, returned by attr()
+    /// @details A writable view (IsConst == false) creates a missing attribute
+    /// on access, a read-only view (IsConst == true) reports it as out of range
+    /// instead. The view borrows the value it points at and owns nothing.
+    /// @note only instantiated once the attribute API is actually used
+    template<typename JsonType, bool IsConst>
+    class attribute_proxy
+    {
+      public:
+        using json_type = JsonType;
+        using object_type = typename JsonType::object_t;
+        using key_type = typename object_type::key_type;
+        using size_type = typename object_type::size_type;
+        using const_reference = typename JsonType::const_reference;
+        using reference = typename std::conditional<IsConst, const_reference,
+                              typename JsonType::reference>::type;
+        using iterator = typename detail::attr_iterators<object_type>::iterator;
+        using const_iterator = typename detail::attr_iterators<object_type>::const_iterator;
+        using value_iterator = typename std::conditional<IsConst, const_iterator, iterator>::type;
+
+        explicit attribute_proxy(typename std::conditional<IsConst, const JsonType, JsonType>::type* json) noexcept
+            : m_json(json)
+        {
+            JsonType::check_attribute_support();
+        }
+
+        /// @brief access an attribute; a writable view creates it if missing
+        reference operator[](const key_type& key) const
+        {
+            return access_impl(key, std::integral_constant<bool, IsConst> {});
+        }
+
+        /// @brief access an attribute, throwing if it does not exist
+        JSON_HEDLEY_WARN_UNUSED_RESULT
+        reference at(const key_type& key) const
+        {
+            return m_json->at_attr(key);
+        }
+
+        /// @brief check the existence of an attribute
+        JSON_HEDLEY_WARN_UNUSED_RESULT
+        bool contains(const key_type& key) const
+        {
+            return m_json->contains_attr(key);
+        }
+
+        /// @brief number of attributes
+        JSON_HEDLEY_WARN_UNUSED_RESULT
+        size_type size() const
+        {
+            return m_json->attr_size();
+        }
+
+        /// @brief whether the object has no attributes
+        JSON_HEDLEY_WARN_UNUSED_RESULT
+        bool empty() const
+        {
+            return m_json->attr_empty();
+        }
+
+        /// @brief returns an iterator to the first attribute; an iterator
+        /// dereferences to a std::pair<const key_type, value_type>
+        value_iterator begin() const
+        {
+            return m_json->attr_begin();
+        }
+
+        /// @brief returns an iterator past the last attribute
+        value_iterator end() const
+        {
+            return m_json->attr_end();
+        }
+
+        /// @brief set an attribute, rejecting values that are not primitives
+        /// @note only available on a writable view
+        template<bool B = IsConst, typename std::enable_if<!B, int>::type* = 0>
+        void set(const key_type& key, const_reference value) const
+        {
+            m_json->set_attr(key, value);
+        }
+
+        /// @brief remove an attribute
+        /// @note only available on a writable view
+        template<bool B = IsConst, typename std::enable_if<!B, int>::type* = 0>
+        size_type erase(const key_type& key) const
+        {
+            return m_json->erase_attr(key);
+        }
+
+        /// @brief remove all attributes
+        /// @note only available on a writable view
+        template<bool B = IsConst, typename std::enable_if<!B, int>::type* = 0>
+        void clear() const
+        {
+            m_json->clear_attrs();
+        }
+
+      private:
+        // read-only view: a missing attribute is an error
+        reference access_impl(const key_type& key, std::true_type /* IsConst */) const
+        {
+            return m_json->at_attr(key);
+        }
+
+        // writable view: a missing attribute is created
+        reference access_impl(const key_type& key, std::false_type /* IsConst */) const
+        {
+            return m_json->attr(key);
+        }
+
+        typename std::conditional<IsConst, const JsonType, JsonType>::type* m_json;
+    };
+
+    /// @brief access the attributes of the object
+    /// @details A null value becomes an empty object first, like operator[]
+    attribute_proxy<basic_json, false> attr()
+    {
+        check_attribute_support();
+
+        // implicitly convert null to object
+        if (is_null())
+        {
+            m_data.m_type = value_t::object;
+            m_data.m_value.object = create<object_t>();
+            assert_invariant();
+        }
+
+        if (JSON_HEDLEY_UNLIKELY(!is_object()))
+        {
+            JSON_THROW(type_error::create(305, detail::concat("cannot use attr() with ", type_name()), this));
+        }
+
+        return attribute_proxy<basic_json, false>(this);
+    }
+
+    /// @brief access the attributes of the object
+    attribute_proxy<basic_json, true> attr() const
+    {
+        check_attribute_support();
+
+        if (JSON_HEDLEY_UNLIKELY(!is_null() && !is_object()))
+        {
+            JSON_THROW(type_error::create(305, detail::concat("cannot use attr() with ", type_name()), this));
+        }
+
+        return attribute_proxy<basic_json, true>(this);
+    }
+
+    /// @brief access an attribute, creating it if it does not exist
+    reference attr(const typename object_t::key_type& key)
+    {
+        check_attribute_support();
+
+        // implicitly convert null to object
+        if (is_null())
+        {
+            m_data.m_type = value_t::object;
+            m_data.m_value.object = create<object_t>();
+            assert_invariant();
+        }
+
+        if (JSON_HEDLEY_LIKELY(is_object()))
+        {
+            auto result = m_data.m_value.object->attr_find(key);
+            if (result == m_data.m_value.object->attr_end())
+            {
+                result = m_data.m_value.object->attr_emplace(key, nullptr).first;
+            }
+            return set_parent(result->second);
+        }
+
+        JSON_THROW(type_error::create(305, detail::concat("cannot use attr() with a string argument with ", type_name()), this));
+    }
+
+    /// @brief access an attribute
+    const_reference attr(const typename object_t::key_type& key) const
+    {
+        return at_attr(key);
+    }
+
+    /// @brief access an attribute, throwing if it does not exist
+    reference at_attr(const typename object_t::key_type& key)
+    {
+        check_attribute_support();
+
+        // at_attr only works for objects
+        if (JSON_HEDLEY_LIKELY(is_object()))
+        {
+            auto result = m_data.m_value.object->attr_find(key);
+            if (result == m_data.m_value.object->attr_end())
+            {
+                JSON_THROW(out_of_range::create(403, detail::concat("attribute '", key, "' not found"), this));
+            }
+            return set_parent(result->second);
+        }
+
+        JSON_THROW(type_error::create(304, detail::concat("cannot use at_attr() with ", type_name()), this));
+    }
+
+    /// @brief access an attribute, throwing if it does not exist
+    const_reference at_attr(const typename object_t::key_type& key) const
+    {
+        check_attribute_support();
+
+        // at_attr only works for objects
+        if (JSON_HEDLEY_LIKELY(is_object()))
+        {
+            auto result = m_data.m_value.object->attr_find(key);
+            if (result == m_data.m_value.object->attr_end())
+            {
+                JSON_THROW(out_of_range::create(403, detail::concat("attribute '", key, "' not found"), this));
+            }
+            return result->second;
+        }
+
+        JSON_THROW(type_error::create(304, detail::concat("cannot use at_attr() with ", type_name()), this));
+    }
+
+    /// @brief check the existence of an attribute
+    JSON_HEDLEY_WARN_UNUSED_RESULT
+    bool contains_attr(const typename object_t::key_type& key) const
+    {
+        check_attribute_support();
+        return is_object() && m_data.m_value.object->attr_count(key) != 0;
+    }
+
+    /// @brief number of attributes of the object
+    JSON_HEDLEY_WARN_UNUSED_RESULT
+    size_type attr_size() const
+    {
+        check_attribute_support();
+        return is_object() ? m_data.m_value.object->attr_size() : 0;
+    }
+
+    /// @brief whether the object has no attributes
+    JSON_HEDLEY_WARN_UNUSED_RESULT
+    bool attr_empty() const
+    {
+        check_attribute_support();
+        return !is_object() || m_data.m_value.object->attr_empty();
+    }
+
+    /// @brief set an attribute, rejecting values that are not primitives
+    void set_attr(const typename object_t::key_type& key, const_reference value)
+    {
+        check_attribute_support();
+        check_attribute_value(value);
+        attr(key) = value;
+    }
+
+    /// @brief remove an attribute
+    size_type erase_attr(const typename object_t::key_type& key)
+    {
+        check_attribute_support();
+
+        if (JSON_HEDLEY_LIKELY(is_object()))
+        {
+            const size_type res = m_data.m_value.object->attr_erase(key);
+            set_parents_after_object_erase();
+            return res;
+        }
+
+        JSON_THROW(type_error::create(307, detail::concat("cannot use erase_attr() with ", type_name()), this));
+    }
+
+    /// @brief remove all attributes of the object
+    void clear_attrs()
+    {
+        check_attribute_support();
+
+        if (JSON_HEDLEY_LIKELY(is_object()))
+        {
+            m_data.m_value.object->clear_attrs();
+            return;
+        }
+
+        JSON_THROW(type_error::create(307, detail::concat("cannot use clear_attrs() with ", type_name()), this));
+    }
+
+    /// @brief returns an iterator to the first attribute
+    attr_iterator attr_begin()
+    {
+        check_attribute_support();
+        return is_object() ? m_data.m_value.object->attr_begin() : attr_iterator();
+    }
+
+    /// @brief returns an iterator to the first attribute
+    const_attr_iterator attr_begin() const
+    {
+        check_attribute_support();
+        return is_object() ? m_data.m_value.object->attr_cbegin() : const_attr_iterator();
+    }
+
+    /// @brief returns an iterator past the last attribute
+    attr_iterator attr_end()
+    {
+        check_attribute_support();
+        return is_object() ? m_data.m_value.object->attr_end() : attr_iterator();
+    }
+
+    /// @brief returns an iterator past the last attribute
+    const_attr_iterator attr_end() const
+    {
+        check_attribute_support();
+        return is_object() ? m_data.m_value.object->attr_cend() : const_attr_iterator();
+    }
+
+    /// @brief returns a const iterator to the first attribute
+    const_attr_iterator attr_cbegin() const
+    {
+        return attr_begin();
+    }
+
+    /// @brief returns a const iterator past the last attribute
+    const_attr_iterator attr_cend() const
+    {
+        return attr_end();
+    }
+
+    /// @brief compare two values, including their attributes
+    /// @details operator== only compares members - like the iterators, size()
+    /// and get<std::map<...>>() do - so two objects that differ only in their
+    /// attributes compare equal; this function compares both kinds
+    JSON_HEDLEY_WARN_UNUSED_RESULT
+    bool equals_with_attributes(const_reference other) const
+    {
+        check_attribute_support();
+
+        // the members have to be equal ...
+        if (*this != other)
+        {
+            return false;
+        }
+
+        // ... and so do the attributes, recursively
+        if (is_object())
+        {
+            // a value equal to an object is an object itself
+            const auto* other_object = other.m_data.m_value.object;
+            if (m_data.m_value.object->attr_size() != other_object->attr_size())
+            {
+                return false;
+            }
+            for (auto it = attr_begin(), last = attr_end(); it != last; ++it)
+            {
+                const auto found = other_object->attr_find(it->first);
+                if (found == other_object->attr_end() || !it->second.equals_with_attributes(found->second))
+                {
+                    return false;
+                }
+            }
+        }
+
+        return true;
+    }
+
+    /// @brief rejects the attribute API at compile time for object types that
+    /// store no attributes
+    /// @details internal helper called by every function of the attribute API
+    static void check_attribute_support()
+    {
+        static_assert(detail::basic_json_has_attributes<basic_json>::value,
+                      "attributes are only supported by nlohmann::json_attrs and nlohmann::ordered_json_attrs; "
+                      "the object type in use stores members only");
+    }
+
+    /// @brief rejects a value that cannot be stored as an attribute
+    void check_attribute_value(const_reference value) const
+    {
+        if (JSON_HEDLEY_UNLIKELY(value.is_object() || value.is_array() || value.is_binary() || value.is_discarded()))
+        {
+            JSON_THROW(type_error::create(302, detail::concat("an attribute value must be a primitive, but is ", value.type_name()), this));
+        }
+    }
 
     ///////////////
     // iterators //
